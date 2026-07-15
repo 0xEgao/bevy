@@ -9,7 +9,7 @@ use fixedbitset::FixedBitSet;
 use std::eprintln;
 use std::{
     backtrace::Backtrace,
-    sync::{Mutex, MutexGuard},
+    sync::{Mutex, MutexGuard, PoisonError},
 };
 
 #[cfg(feature = "trace")]
@@ -17,7 +17,7 @@ use tracing::{info_span, Span};
 
 use crate::{
     error::{
-        BevyError, ErrorContext, ErrorHandler, Result, Severity,
+        BevyError, ErrorContext, ErrorHandler, ErrorHandlerCommandQueue, Result, Severity,
         PANIC_ORIGINATES_FROM_ERROR_HANDLER,
     },
     prelude::Resource,
@@ -30,7 +30,7 @@ use crate::{
 #[cfg(feature = "hotpatching")]
 use crate::{prelude::DetectChanges, HotPatchChanges};
 
-use super::__rust_begin_short_backtrace;
+use super::{__rust_begin_short_backtrace, apply_deferred_conditions};
 
 /// Borrowed data used by the [`MultiThreadedExecutor`].
 struct Environment<'env, 'sys> {
@@ -38,6 +38,7 @@ struct Environment<'env, 'sys> {
     systems: &'sys [SyncUnsafeCell<SystemWithAccess>],
     conditions: SyncUnsafeCell<Conditions<'sys>>,
     world_cell: UnsafeWorldCell<'env>,
+    error_handler_commands: &'env Mutex<ErrorHandlerCommandQueue>,
 }
 
 struct Conditions<'a> {
@@ -52,6 +53,7 @@ impl<'env, 'sys> Environment<'env, 'sys> {
         executor: &'env MultiThreadedExecutor,
         schedule: &'sys mut SystemSchedule,
         world: &'env mut World,
+        error_handler_commands: &'env Mutex<ErrorHandlerCommandQueue>,
     ) -> Self {
         Environment {
             executor,
@@ -63,6 +65,7 @@ impl<'env, 'sys> Environment<'env, 'sys> {
                 systems_in_sets_with_conditions: &schedule.systems_in_sets_with_conditions,
             }),
             world_cell: world.as_unsafe_world_cell(),
+            error_handler_commands,
         }
     }
 }
@@ -100,6 +103,8 @@ pub struct MultiThreadedExecutor {
     apply_final_deferred: bool,
     /// When set, tells the executor that a thread has panicked.
     panic_payload: Mutex<Option<Box<dyn Any + Send>>>,
+    /// Commands queued by the fallback error handler.
+    error_handler_commands: Mutex<ErrorHandlerCommandQueue>,
     starting_systems: FixedBitSet,
     /// Cached tracing span
     #[cfg(feature = "trace")]
@@ -246,6 +251,17 @@ impl SystemExecutor for MultiThreadedExecutor {
         let state = self.state.get_mut().unwrap();
         // reset counts
         if schedule.systems.is_empty() {
+            if self.apply_final_deferred {
+                apply_deferred_conditions(
+                    &mut schedule.system_conditions,
+                    &mut schedule.set_conditions,
+                    world,
+                );
+                self.error_handler_commands
+                    .get_mut()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .apply(world);
+            }
             return;
         }
         state.num_running_systems = 0;
@@ -275,7 +291,7 @@ impl SystemExecutor for MultiThreadedExecutor {
             .map(|e| e.0.clone());
         let thread_executor = thread_executor.as_deref();
 
-        let environment = &Environment::new(self, schedule, world);
+        let environment = &Environment::new(self, schedule, world, &self.error_handler_commands);
 
         ComputeTaskPool::get_or_init(TaskPool::default).scope_with_executor(
             false,
@@ -295,12 +311,21 @@ impl SystemExecutor for MultiThreadedExecutor {
 
         // End the borrows of self and world in environment by copying out the reference to systems.
         let systems = environment.systems;
+        let conditions = environment.conditions.get();
 
         let state = self.state.get_mut().unwrap();
         if self.apply_final_deferred {
             // Do one final apply buffers after all systems have completed
             // Commands should be applied while on the scope's thread, not the executor's thread
-            let res = apply_deferred(&state.unapplied_systems, systems, world, error_handler);
+            let res = apply_deferred(
+                &state.unapplied_systems,
+                systems,
+                // SAFETY: The task scope has completed, so no condition is still running.
+                unsafe { &mut *conditions },
+                world,
+                error_handler,
+                &self.error_handler_commands,
+            );
             if let Err(payload) = res {
                 let panic_payload = self.panic_payload.get_mut().unwrap();
                 *panic_payload = Some(payload);
@@ -397,6 +422,7 @@ impl MultiThreadedExecutor {
             starting_systems: FixedBitSet::new(),
             apply_final_deferred: true,
             panic_payload: Mutex::new(None),
+            error_handler_commands: Mutex::new(ErrorHandlerCommandQueue::new()),
             #[cfg(feature = "trace")]
             executor_span: info_span!("multithreaded executor"),
         }
@@ -510,6 +536,7 @@ impl ExecutorState {
                         conditions,
                         context.environment.world_cell,
                         context.error_handler,
+                        context.environment.error_handler_commands,
                     )
                 } {
                     self.skip_system_and_signal_dependents(system_index);
@@ -594,6 +621,7 @@ impl ExecutorState {
         conditions: &mut Conditions,
         world: UnsafeWorldCell,
         error_handler: ErrorHandler,
+        error_handler_commands: &Mutex<ErrorHandlerCommandQueue>,
     ) -> bool {
         let mut should_run = !self.skipped_systems.contains(system_index);
 
@@ -611,6 +639,7 @@ impl ExecutorState {
                     &mut conditions.set_conditions[set_idx],
                     world,
                     error_handler,
+                    error_handler_commands,
                     system,
                     true,
                 )
@@ -634,6 +663,7 @@ impl ExecutorState {
                 &mut conditions.system_conditions[system_index],
                 world,
                 error_handler,
+                error_handler_commands,
                 system,
                 false,
             )
@@ -677,6 +707,8 @@ impl ExecutorState {
                 },
                 system,
                 context.error_handler,
+                context.environment.error_handler_commands,
+                context.environment.world_cell,
                 "System panicked",
             );
             context.system_completed(system_index, res, system);
@@ -709,8 +741,12 @@ impl ExecutorState {
                 let res = apply_deferred(
                     &unapplied_systems,
                     context.environment.systems,
+                    // SAFETY: `can_run` starts this exclusive apply-deferred system only when no
+                    // systems or conditions are running.
+                    unsafe { &mut *context.environment.conditions.get() },
                     world,
                     context.error_handler,
+                    context.environment.error_handler_commands,
                 );
                 context.system_completed(system_index, res, system);
             };
@@ -725,6 +761,8 @@ impl ExecutorState {
                     |system| __rust_begin_short_backtrace::run(system, world),
                     system,
                     context.error_handler,
+                    context.environment.error_handler_commands,
+                    context.environment.world_cell,
                     "Exclusive system panicked",
                 );
                 context.system_completed(system_index, res, system);
@@ -777,22 +815,38 @@ impl ExecutorState {
 fn apply_deferred(
     unapplied_systems: &FixedBitSet,
     systems: &[SyncUnsafeCell<SystemWithAccess>],
+    conditions: &mut Conditions,
     world: &mut World,
     error_handler: ErrorHandler,
+    error_handler_commands: &Mutex<ErrorHandlerCommandQueue>,
 ) -> Result<(), Box<dyn Any + Send>> {
     for system_index in unapplied_systems.ones() {
         // SAFETY: none of these systems are running, no other references exist
         let system = &mut unsafe { &mut *systems[system_index].get() }.system;
+        let world_cell = world.as_unsafe_world_cell();
         handle_errors(
             |system| {
-                system.apply_deferred(world);
+                // SAFETY: no systems are running, and this mutable reference is dropped before
+                // `handle_errors` uses `world_cell` to invoke the error handler.
+                system.apply_deferred(unsafe { world_cell.world_mut() });
                 Ok(())
             },
             system,
             error_handler,
+            error_handler_commands,
+            world_cell,
             "Encountered a panic while applying system buffers",
         )?;
     }
+    apply_deferred_conditions(
+        conditions.system_conditions,
+        conditions.set_conditions,
+        world,
+    );
+    error_handler_commands
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .apply(world);
     Ok(())
 }
 
@@ -803,6 +857,7 @@ unsafe fn evaluate_and_fold_conditions(
     conditions: &mut [ConditionWithAccess],
     world: UnsafeWorldCell,
     error_handler: ErrorHandler,
+    error_handler_commands: &Mutex<ErrorHandlerCommandQueue>,
     for_system: &ScheduleSystem,
     on_set: bool,
 ) -> bool {
@@ -826,7 +881,8 @@ unsafe fn evaluate_and_fold_conditions(
                 Err(payload) if panic_originates_from_error_handler => std::panic::resume_unwind(payload),
                 // Let the error handler handle the panic
                 Err(_) => {
-                    __rust_begin_short_backtrace::error_handler(
+                    handle_error(
+                        error_handler_commands,
                         error_handler,
                         BevyError::new_with_backtrace(
                             Severity::Panic,
@@ -839,10 +895,12 @@ unsafe fn evaluate_and_fold_conditions(
                             system: for_system.name(),
                             on_set,
                         },
+                        world,
                     ); false},
                 // Condition returned an error, let the error handler handle it
                 Ok(Err(RunSystemError::Failed(err))) => {
-                    __rust_begin_short_backtrace::error_handler(
+                    handle_error(
+                        error_handler_commands,
                         error_handler,
                         err,
                         ErrorContext::RunCondition {
@@ -851,6 +909,7 @@ unsafe fn evaluate_and_fold_conditions(
                             system: for_system.name(),
                             on_set,
                         },
+                        world,
                     ); false
                 },
                 Ok(Err(RunSystemError::Skipped(_))) => false,
@@ -866,6 +925,8 @@ fn handle_errors(
     f: impl FnOnce(&mut BoxedSystem) -> Result<(), RunSystemError>,
     system: &mut BoxedSystem,
     error_handler: ErrorHandler,
+    error_handler_commands: &Mutex<ErrorHandlerCommandQueue>,
+    world: UnsafeWorldCell,
     error_message: &str,
 ) -> Result<(), Box<dyn Any + Send>> {
     PANIC_ORIGINATES_FROM_ERROR_HANDLER.set(false);
@@ -876,7 +937,8 @@ fn handle_errors(
         Err(payload) if panic_originates_from_error_handler => Err(payload),
         // Let the error handler handle the panic, passing on any panic it throws
         Err(_) => std::panic::catch_unwind(AssertUnwindSafe(|| {
-            __rust_begin_short_backtrace::error_handler(
+            handle_error(
+                error_handler_commands,
                 error_handler,
                 BevyError::new_with_backtrace(
                     Severity::Panic,
@@ -887,22 +949,44 @@ fn handle_errors(
                     name: system.name(),
                     last_run: system.get_last_run(),
                 },
+                world,
             );
         })),
         // System returned an error, let the error handler handle it, passing on any panic it throws
         Ok(Err(RunSystemError::Failed(err))) => std::panic::catch_unwind(AssertUnwindSafe(|| {
-            __rust_begin_short_backtrace::error_handler(
+            handle_error(
+                error_handler_commands,
                 error_handler,
                 err,
                 ErrorContext::System {
                     name: system.name(),
                     last_run: system.get_last_run(),
                 },
+                world,
             );
         })),
         // Success (or skipped system)
         _ => Ok(()),
     }
+}
+
+fn handle_error(
+    error_handler_commands: &Mutex<ErrorHandlerCommandQueue>,
+    error_handler: ErrorHandler,
+    error: BevyError,
+    context: ErrorContext,
+    world: UnsafeWorldCell,
+) {
+    let mut commands = error_handler_commands
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    __rust_begin_short_backtrace::error_handler(
+        error_handler,
+        error,
+        context,
+        &mut commands,
+        world,
+    );
 }
 
 /// New-typed [`ThreadExecutor`] [`Resource`] that is used to run systems on the main thread
@@ -990,9 +1074,14 @@ mod tests {
         });
 
         static HANDLER_CALLED: AtomicBool = AtomicBool::new(false);
-        fn handle(_: BevyError, ctx: ErrorContext) {
+        fn handle<'w, 's>(
+            _: BevyError,
+            ctx: ErrorContext,
+            commands: Commands<'w, 's>,
+        ) -> Commands<'w, 's> {
             assert!(matches!(ctx, ErrorContext::System { .. }));
             HANDLER_CALLED.store(true, Relaxed);
+            commands
         }
         world.insert_resource(FallbackErrorHandler(handle));
 
@@ -1006,7 +1095,7 @@ mod tests {
         assert!(HANDLER_CALLED.load(Relaxed));
 
         const PANIC_PAYLOAD: &str = "UwU";
-        fn panic(_: BevyError, ctx: ErrorContext) {
+        fn panic<'w, 's>(_: BevyError, ctx: ErrorContext, _: Commands<'w, 's>) -> Commands<'w, 's> {
             assert!(matches!(ctx, ErrorContext::System { .. }));
             PANIC_ORIGINATES_FROM_ERROR_HANDLER.set(true);
             panic!("{}", PANIC_PAYLOAD);

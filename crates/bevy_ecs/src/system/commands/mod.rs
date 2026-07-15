@@ -647,6 +647,7 @@ impl<'w, 's> Commands<'w, 's> {
     ///
     /// If the [`Command`] returns a [`Result`],
     /// the given `error_handler` will be used to handle error cases.
+    /// The handler can queue additional work with the provided [`Commands`] and must return it.
     ///
     /// To implicitly use the fallback error handler, see [`Commands::queue`].
     ///
@@ -695,7 +696,9 @@ impl<'w, 's> Commands<'w, 's> {
     pub fn queue_handled(
         &mut self,
         command: impl Command,
-        error_handler: impl FnOnce(BevyError, ErrorContext) + Send + 'static,
+        error_handler: impl for<'a, 'b> FnOnce(BevyError, ErrorContext, Commands<'a, 'b>) -> Commands<'a, 'b>
+            + Send
+            + 'static,
     ) {
         self.queue_internal(command.handle_error_with(error_handler));
     }
@@ -2033,6 +2036,7 @@ impl<'a> EntityCommands<'a> {
     /// which will get executed for the current [`Entity`].
     ///
     /// The given `error_handler` will be used to handle error cases.
+    /// The handler can queue additional work with the provided [`Commands`] and must return it.
     /// Every [`EntityCommand`] checks whether the entity exists at the time of execution
     /// and returns an error if it does not.
     ///
@@ -2069,7 +2073,9 @@ impl<'a> EntityCommands<'a> {
     pub fn queue_handled(
         &mut self,
         command: impl EntityCommand,
-        error_handler: impl FnOnce(BevyError, ErrorContext) + Send + 'static,
+        error_handler: impl for<'w, 's> FnOnce(BevyError, ErrorContext, Commands<'w, 's>) -> Commands<'w, 's>
+            + Send
+            + 'static,
     ) -> &mut Self {
         self.commands
             .queue_handled(command.with_entity(self.entity), error_handler);

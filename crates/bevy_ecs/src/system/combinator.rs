@@ -4,7 +4,7 @@ use core::marker::PhantomData;
 
 use crate::{
     change_detection::{CheckChangeTicks, Tick},
-    error::ErrorContext,
+    error::{ErrorContext, ErrorHandlerCommandQueue},
     prelude::World,
     query::FilteredAccessSet,
     schedule::InternedSystemSet,
@@ -117,6 +117,7 @@ pub struct CombinatorSystem<Func, A, B> {
     a: A,
     b: B,
     name: DebugName,
+    error_handler_commands: ErrorHandlerCommandQueue,
 }
 
 impl<Func, A, B> CombinatorSystem<Func, A, B> {
@@ -129,6 +130,7 @@ impl<Func, A, B> CombinatorSystem<Func, A, B> {
             a,
             b,
             name,
+            error_handler_commands: ErrorHandlerCommandQueue::default(),
         }
     }
 }
@@ -148,7 +150,7 @@ where
 
     #[inline]
     fn flags(&self) -> super::SystemStateFlags {
-        self.a.flags() | self.b.flags()
+        self.a.flags() | self.b.flags() | super::SystemStateFlags::DEFERRED
     }
 
     unsafe fn run_unsafe(
@@ -156,7 +158,10 @@ where
         input: SystemIn<'_, Self>,
         world: UnsafeWorldCell,
     ) -> Result<Self::Out, RunSystemError> {
-        struct PrivateUnsafeWorldCell<'w>(UnsafeWorldCell<'w>);
+        struct PrivateSystemData<'w, 's> {
+            world: UnsafeWorldCell<'w>,
+            error_handler_commands: &'s mut ErrorHandlerCommandQueue,
+        }
 
         // Since control over handling system run errors is passed on to the
         // implementation of `Func::combine`, which may run the two closures
@@ -165,19 +170,22 @@ where
         unsafe fn run_system<S: System>(
             system: &mut S,
             input: SystemIn<S>,
-            world: &mut PrivateUnsafeWorldCell,
+            data: &mut PrivateSystemData,
         ) -> Result<S::Out, RunSystemError> {
             // SAFETY: see comment on `Func::combine` call
-            match unsafe { system.run_unsafe(input, world.0) } {
+            match unsafe { system.run_unsafe(input, data.world) } {
                 // let the world's fallback error handler handle the error if `Failed(_)`
                 Err(RunSystemError::Failed(err)) => {
                     // SAFETY: We registered access to FallbackErrorHandler in `initialize`.
-                    (unsafe { world.0.fallback_error_handler() })(
+                    let handler = unsafe { data.world.fallback_error_handler() };
+                    data.error_handler_commands.handle(
+                        handler,
                         err,
                         ErrorContext::System {
                             name: system.name(),
                             last_run: system.get_last_run(),
                         },
+                        data.world,
                     );
 
                     // Since the error handler takes the error by value, create a new error:
@@ -194,13 +202,16 @@ where
 
         Func::combine(
             input,
-            &mut PrivateUnsafeWorldCell(world),
+            &mut PrivateSystemData {
+                world,
+                error_handler_commands: &mut self.error_handler_commands,
+            },
             // SAFETY: The world accesses for both underlying systems have been registered,
             // so the caller will guarantee that no other systems will conflict with (`a` or `b`) and the `FallbackErrorHandler` resource.
             // If either system has `is_exclusive()`, then the combined system also has `is_exclusive`.
             // Since we require a `combine` to pass in a mutable reference to `world` and that's a private type
             // passed to a function as an unbound non-'static generic argument, they can never be called in parallel
-            // or re-entrantly because that would require forging another instance of `PrivateUnsafeWorldCell`.
+            // or re-entrantly because that would require forging another instance of `PrivateSystemData`.
             // This means that the world accesses in the two closures will not conflict with each other.
             // The closure's access to the FallbackErrorHandler does not
             // conflict with any potential access to the FallbackErrorHandler by
@@ -222,12 +233,14 @@ where
     fn apply_deferred(&mut self, world: &mut World) {
         self.a.apply_deferred(world);
         self.b.apply_deferred(world);
+        self.error_handler_commands.apply(world);
     }
 
     #[inline]
     fn queue_deferred(&mut self, mut world: crate::world::DeferredWorld) {
         self.a.queue_deferred(world.reborrow());
-        self.b.queue_deferred(world);
+        self.b.queue_deferred(world.reborrow());
+        self.error_handler_commands.queue(&mut world);
     }
 
     fn initialize(&mut self, world: &mut World) -> FilteredAccessSet {

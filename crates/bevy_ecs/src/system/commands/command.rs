@@ -15,7 +15,7 @@ use crate::{
     message::{Message, Messages},
     resource::Resource,
     schedule::ScheduleLabel,
-    system::{IntoSystem, SystemId, SystemInput},
+    system::{Commands, IntoSystem, SystemId, SystemInput},
     world::{FromWorld, SpawnBatchIter, World},
 };
 
@@ -62,21 +62,26 @@ pub trait Command: Send + 'static {
 
     /// Takes a [`Command`] that returns a Result and uses a given error handler function to convert it into
     /// a [`Command`] that internally handles an error if it occurs and returns `()`.
+    /// The handler can queue additional work with the provided [`Commands`] and must return it.
     #[inline]
     fn handle_error_with(
         self,
-        error_handler: impl FnOnce(BevyError, ErrorContext) + Send + 'static,
+        error_handler: impl for<'w, 's> FnOnce(BevyError, ErrorContext, Commands<'w, 's>) -> Commands<'w, 's>
+            + Send
+            + 'static,
     ) -> impl Command<Out = ()>
     where
         Self: Sized,
     {
         move |world: &mut World| {
             if let Some(error) = self.apply(world).to_err() {
+                let commands = world.commands();
                 error_handler(
                     error,
                     ErrorContext::Command {
                         name: DebugName::type_name::<Self>(),
                     },
+                    commands,
                 );
             }
         }
@@ -91,11 +96,14 @@ pub trait Command: Send + 'static {
     {
         move |world: &mut World| {
             if let Some(error) = self.apply(world).to_err() {
-                world.fallback_error_handler()(
+                let handler = world.fallback_error_handler();
+                let commands = world.commands();
+                handler(
                     error,
                     ErrorContext::Command {
                         name: DebugName::type_name::<Self>(),
                     },
+                    commands,
                 );
             }
         }

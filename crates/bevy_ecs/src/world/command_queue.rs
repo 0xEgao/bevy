@@ -414,7 +414,9 @@ fn handle_panic_payload(
     };
     let error =
         BevyError::new_with_backtrace(Severity::Panic, "Command panicked", Backtrace::disabled());
-    world.fallback_error_handler()(error, ErrorContext::Command { name });
+    let handler = world.fallback_error_handler();
+    let commands = world.commands();
+    handler(error, ErrorContext::Command { name }, commands);
 }
 
 impl Drop for CommandQueueRunner<'_> {
@@ -440,6 +442,7 @@ mod test {
         component::Component,
         error::{BevyError, ErrorContext, FallbackErrorHandler},
         resource::Resource,
+        system::Commands,
     };
     use alloc::{
         borrow::ToOwned,
@@ -592,8 +595,13 @@ mod test {
         // handles the panicking command.
         queue.push(SpawnCommand);
 
-        fn record_last_error(error: BevyError, context: ErrorContext) {
+        fn record_last_error<'w, 's>(
+            error: BevyError,
+            context: ErrorContext,
+            commands: Commands<'w, 's>,
+        ) -> Commands<'w, 's> {
             *LAST_ERROR.lock().unwrap() = Some((error, context));
+            commands
         }
         static LAST_ERROR: Mutex<Option<(BevyError, ErrorContext)>> = Mutex::new(None);
         *LAST_ERROR.lock().unwrap() = None;
@@ -651,8 +659,13 @@ mod test {
         #[derive(Resource, Default)]
         struct Order(Vec<usize>);
 
-        fn record_last_error(error: BevyError, context: ErrorContext) {
+        fn record_last_error<'w, 's>(
+            error: BevyError,
+            context: ErrorContext,
+            commands: Commands<'w, 's>,
+        ) -> Commands<'w, 's> {
             *LAST_ERROR.lock().unwrap() = Some((error, context));
+            commands
         }
         static LAST_ERROR: Mutex<Option<(BevyError, ErrorContext)>> = Mutex::new(None);
         *LAST_ERROR.lock().unwrap() = None;

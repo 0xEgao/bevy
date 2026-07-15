@@ -15,7 +15,7 @@ pub use fixedbitset::FixedBitSet;
 
 use crate::{
     change_detection::{CheckChangeTicks, Tick},
-    error::{BevyError, ErrorContext, Result},
+    error::{ErrorHandler, Result},
     prelude::{IntoSystemSet, SystemSet},
     query::FilteredAccessSet,
     schedule::{
@@ -36,7 +36,7 @@ pub trait SystemExecutor: Send + Sync {
         schedule: &mut SystemSchedule,
         world: &mut World,
         skip_systems: Option<&FixedBitSet>,
-        error_handler: fn(BevyError, ErrorContext),
+        error_handler: ErrorHandler,
     );
     /// Sets whether deferred system buffers should be applied after all systems have run.
     fn set_apply_final_deferred(&mut self, value: bool);
@@ -129,6 +129,20 @@ impl SystemSchedule {
     ///   systems in the returned [`Vec`] should be considered undefined behavior.
     pub unsafe fn systems_mut(&mut self) -> &mut Vec<SystemWithAccess> {
         &mut self.systems
+    }
+}
+
+// Run-condition combinators can own commands produced by an error handler even though their
+// inner systems are read-only, so their deferred buffers must be applied at normal boundaries.
+fn apply_deferred_conditions(
+    system_conditions: &mut [Vec<ConditionWithAccess>],
+    set_conditions: &mut [Vec<ConditionWithAccess>],
+    world: &mut World,
+) {
+    for condition in system_conditions.iter_mut().chain(set_conditions).flatten() {
+        if condition.has_deferred() {
+            condition.apply_deferred(world);
+        }
     }
 }
 
@@ -318,8 +332,10 @@ mod __rust_begin_short_backtrace {
         error_handler: crate::error::ErrorHandler,
         err: crate::error::BevyError,
         err_context: crate::error::ErrorContext,
+        commands: &mut crate::error::ErrorHandlerCommandQueue,
+        world: UnsafeWorldCell,
     ) {
-        error_handler(err, err_context);
+        commands.handle(error_handler, err, err_context, world);
         black_box(());
     }
 }
@@ -327,9 +343,11 @@ mod __rust_begin_short_backtrace {
 #[cfg(test)]
 mod tests {
     use crate::{
+        error::{BevyError, ErrorContext, FallbackErrorHandler, Result},
         prelude::{Component, In, IntoSystem, Resource, Schedule},
+        schedule::{IntoScheduleConfigs, SystemCondition},
         schedule::{MultiThreadedExecutor, SingleThreadedExecutor},
-        system::{Populated, Res, ResMut, Single},
+        system::{Commands, Populated, Res, ResMut, Single},
         world::World,
     };
 
@@ -344,6 +362,107 @@ mod tests {
 
     #[derive(Resource, Default)]
     struct Counter(u8);
+
+    #[derive(Resource, Default)]
+    struct ErrorsHandled(usize);
+
+    fn handle_error_with_commands<'w, 's>(
+        _: BevyError,
+        _: ErrorContext,
+        mut commands: Commands<'w, 's>,
+    ) -> Commands<'w, 's> {
+        commands.queue(|world: &mut World| {
+            world.resource_mut::<ErrorsHandled>().0 += 1;
+        });
+        commands
+    }
+
+    fn fail() -> Result {
+        Err("failed".into())
+    }
+
+    fn fail_condition() -> Result<bool> {
+        Err("failed".into())
+    }
+
+    #[test]
+    fn error_handler_commands_are_applied_single_threaded() {
+        let mut schedule = Schedule::default();
+        schedule.set_executor(SingleThreadedExecutor::new());
+        error_handler_commands_are_applied(schedule);
+    }
+
+    #[test]
+    fn error_handler_commands_are_applied_multi_threaded() {
+        let mut schedule = Schedule::default();
+        schedule.set_executor(MultiThreadedExecutor::new());
+        error_handler_commands_are_applied(schedule);
+    }
+
+    fn error_handler_commands_are_applied(mut schedule: Schedule) {
+        let mut world = World::new();
+        world.init_resource::<ErrorsHandled>();
+        world.insert_resource(FallbackErrorHandler(handle_error_with_commands));
+        schedule.add_systems(fail);
+
+        schedule.run(&mut world);
+
+        assert_eq!(world.resource::<ErrorsHandled>().0, 1);
+    }
+
+    #[test]
+    fn error_handler_commands_respect_deferred_application_single_threaded() {
+        let mut schedule = Schedule::default();
+        schedule.set_executor(SingleThreadedExecutor::new());
+        error_handler_commands_respect_deferred_application(schedule);
+    }
+
+    #[test]
+    fn error_handler_commands_respect_deferred_application_multi_threaded() {
+        let mut schedule = Schedule::default();
+        schedule.set_executor(MultiThreadedExecutor::new());
+        error_handler_commands_respect_deferred_application(schedule);
+    }
+
+    fn error_handler_commands_respect_deferred_application(mut schedule: Schedule) {
+        let mut world = World::new();
+        world.init_resource::<ErrorsHandled>();
+        world.insert_resource(FallbackErrorHandler(handle_error_with_commands));
+        schedule.add_systems(fail);
+        schedule.set_apply_final_deferred(false);
+
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<ErrorsHandled>().0, 0);
+
+        schedule.set_apply_final_deferred(true);
+        schedule.run(&mut world);
+        assert_eq!(world.resource::<ErrorsHandled>().0, 2);
+    }
+
+    #[test]
+    fn error_handler_commands_from_condition_combinator_are_applied_single_threaded() {
+        let mut schedule = Schedule::default();
+        schedule.set_executor(SingleThreadedExecutor::new());
+        error_handler_commands_from_condition_combinator_are_applied(schedule);
+    }
+
+    #[test]
+    fn error_handler_commands_from_condition_combinator_are_applied_multi_threaded() {
+        let mut schedule = Schedule::default();
+        schedule.set_executor(MultiThreadedExecutor::new());
+        error_handler_commands_from_condition_combinator_are_applied(schedule);
+    }
+
+    fn error_handler_commands_from_condition_combinator_are_applied(mut schedule: Schedule) {
+        let mut world = World::new();
+        world.init_resource::<ErrorsHandled>();
+        world.insert_resource(FallbackErrorHandler(handle_error_with_commands));
+        schedule.add_systems((|| {}).run_if(fail_condition.or_else(|| false)));
+
+        schedule.run(&mut world);
+
+        assert_eq!(world.resource::<ErrorsHandled>().0, 1);
+    }
 
     fn set_single_state(mut _single: Single<&TestComponent>, mut state: ResMut<TestState>) {
         state.single_ran = true;

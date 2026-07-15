@@ -29,22 +29,32 @@
 //! signature:
 //!
 //! ```rust,ignore
-//! fn(BevyError, ErrorContext)
+//! for<'w, 's> fn(BevyError, ErrorContext, Commands<'w, 's>) -> Commands<'w, 's>
 //! ```
 //!
 //! The [`ErrorContext`] allows you to access additional details relevant to providing
 //! context surrounding the error – such as the system's [`name`] – in your error messages.
+//! [`Commands`] can be used to send messages or perform cleanup work. Because it is passed by
+//! value, the handler must return it after queuing any work.
 //!
-//! ```rust, ignore
-//! use bevy_ecs::error::{BevyError, ErrorContext, FallbackErrorHandler};
+//! ```rust
+//! use bevy_ecs::{
+//!     error::{BevyError, ErrorContext, FallbackErrorHandler},
+//!     prelude::{Commands, World},
+//! };
 //! use log::trace;
 //!
-//! fn my_error_handler(error: BevyError, ctx: ErrorContext) {
+//! fn my_error_handler<'w, 's>(
+//!     error: BevyError,
+//!     ctx: ErrorContext,
+//!     commands: Commands<'w, 's>,
+//! ) -> Commands<'w, 's> {
 //!    if ctx.name().ends_with("plz_ignore") {
 //!       trace!("Nothing to see here, move along.");
-//!       return;
+//!       commands
+//!   } else {
+//!       bevy_ecs::error::error(error, ctx, commands)
 //!   }
-//!   bevy_ecs::error::error(error, ctx);
 //! }
 //!
 //! fn main() {
